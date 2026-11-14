@@ -1,0 +1,55 @@
+[general]
+static=yes
+writeprotect=no
+clearglobalvars=no
+
+[from-internal]
+; 回音测试：拨 600
+exten => 600,1,Answer()
+ same => n,Wait(1)
+ same => n,Echo()
+ same => n,Hangup()
+
+; 标准 Echo 扩展 *43
+exten => *43,1,Answer()
+ same => n,Echo()
+ same => n,Hangup()
+
+; 分机互拨
+exten => 6001,1,Dial(PJSIP/6001,30)
+ same => n,Hangup()
+exten => 6002,1,Dial(PJSIP/6002,30)
+ same => n,Hangup()
+
+; ---- 手机号呼出：走本机 SIM 卡 + 双向音频桥 (AudioSocket) ----
+exten => _1XXXXXXXXXX,1,Answer()
+ same => n,System(echo ${EXTEN} > /tmp/bridge-target)
+ same => n,AudioSocket(6d7f8a3e-4bcd-4e2f-9a01-0123456789ab,127.0.0.1:9092)
+ same => n,Hangup()
+
+; 短号（10086 等）
+exten => 10086,1,Answer()
+ same => n,System(echo ${EXTEN} > /tmp/bridge-target)
+ same => n,AudioSocket(6d7f8a3e-4bcd-4e2f-9a01-0123456789ab,127.0.0.1:9092)
+ same => n,Hangup()
+
+; 兜底：未注册/未知号码
+exten => _X.,1,Answer()
+ same => n,Wait(1)
+ same => n,Playback(hello-world)
+ same => n,Hangup()
+
+; ---- VoLTE 呼入：对方打 SIM 号 -> 多个 SIP 分机同时振铃 -> 接听后接音频桥 ----
+; 由 mu300-volte-in 监听振铃后 originate Local/s@volte-in 触发。
+; 多终端同时振铃靠 Dial(a&b&...) 实现：谁先接谁通，其余自动挂断。
+; 加/减分机只改下面这一行（每个被叫都要带技术前缀）。
+[volte-in]
+exten => s,1,NoOp(VoLTE incoming, multiring)
+ same => n,Dial(PJSIP/6001&PJSIP/6002,25)
+ same => n,GotoIf($["${DIALSTATUS}" = "ANSWER"]?answered:missed)
+ same => n(answered),NoOp(extension answered, start audio bridge)
+ same => n,AudioSocket(6d7f8a3e-4bcd-4e2f-9a01-0123456789ab,127.0.0.1:9092)
+ same => n,Hangup()
+ same => n(missed),NoOp(no answer, hang up VoLTE)
+ same => n,System(mu300-at -t 6 "AT+CHUP")
+ same => n,Hangup()
