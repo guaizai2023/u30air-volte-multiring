@@ -13,6 +13,7 @@
 `channel originate` 不存在；AMI 是内建的，只是默认没开。
 """
 
+import json
 import os
 import re
 import socket
@@ -24,10 +25,7 @@ URC = os.environ.get("MU300_URC_LOG", "/run/mu300-at/urc/stty_nr0.log")
 LOG = os.environ.get("MU300_IN_LOG", "/tmp/volte-in.log")
 FLAG = "/tmp/volte-incoming"
 AT = os.environ.get("MU300_AT", "/usr/bin/mu300-at")
-# 分机列表（逗号分隔）。只有一个就直接叫它；多个则交给 dialplan 的 Dial(a&b) 同时振铃。
-EXTS = [x.strip() for x in os.environ.get(
-    "MU300_IN_EXTS", os.environ.get("MU300_IN_EXT", "6001")).split(",") if x.strip()]
-CONTEXT = os.environ.get("MU300_IN_CTX", "volte-in")
+EXT = os.environ.get("MU300_IN_EXT", "6001")
 AUDIOSOCKET = os.environ.get("MU300_IN_UUID",
                              "6d7f8a3e-4bcd-4e2f-9a01-0123456789ab") + ",127.0.0.1:9092"
 AMI_HOST = os.environ.get("MU300_AMI_HOST", "127.0.0.1")
@@ -35,6 +33,15 @@ AMI_PORT = int(os.environ.get("MU300_AMI_PORT", "5038"))
 AMI_USER = os.environ.get("MU300_AMI_USER", "mu300")
 AMI_SECRET = os.environ.get("MU300_AMI_SECRET", "mu300ami2026")
 RING_TIMEOUT = 25                        # 与 [volte-in] 里 Dial 的 25 秒对齐
+
+# ---- Yak Phone 推送中继 ------------------------------------------------------
+# Yak 云端只知道本机 device token，不知道什么时候有人打进来；必须在振铃时由我们
+# 主动 POST /v1/notify，它才会发 APNs VoIP push，把被 iOS 挂起的 App 叫醒。
+# 这正是 PortSIP 做不到的地方（它的推送绑死在 PortSIP PBX 上）。
+YAK_PUSH_URL = os.environ.get("MU300_YAK_PUSH_URL", "https://push.yakteam.com/v1/notify")
+YAK_TOKEN_FILE = os.environ.get("MU300_YAK_TOKEN_FILE", "/etc/mu300/yak-push.token")
+YAK_WAKE_DELAY = float(os.environ.get("MU300_YAK_WAKE_DELAY", "1.6"))
+YAK_SIP_DOMAIN = os.environ.get("MU300_YAK_DOMAIN", "192.168.77.1")
 
 state = {"busy": False, "clip": "", "ring_at": 0.0, "triggered": False,
          "triggered_at": 0.0, "timer": None}
@@ -145,6 +152,10 @@ def hangup_later(my_ts):
     if st == 4:
         log("呼入无人接听，挂断 VoLTE")
         at("AT+CHUP", 6)
+        # 补一条漏接通知，锁屏上至少能看到有人打过
+        with lock:
+            num = state.get("clip") or "unknown"
+        yak_notify(num, "missed")
         reset()
 
 
@@ -165,15 +176,14 @@ def trigger():
     except OSError:
         pass
 
-    if len(EXTS) == 1:
-        # 单个分机：直接把 INVITE 送到它，接听后立刻进 AudioSocket（最少的中间环节）
-        log("呼叫 SIP 分机", EXTS[0])
-        ok, detail = AMI().originate("PJSIP/" + EXTS[0], "AudioSocket", AUDIOSOCKET)
-    else:
-        # 多个分机：交给 dialplan 的 Dial(a&b&...)，由 Asterisk 原生完成
-        # 「同时振铃 / 先接先通 / 其余自动挂断」，我们只负责把 Local 通道送进去。
-        log("同时呼叫分机", ",".join(EXTS))
-        ok, detail = AMI().originate("Local/s@" + CONTEXT, "Wait", "90")
+    # ① 先推：iOS 可能早就把这 App 挂起了，不推的话 INVITE 发过去没人处理，
+    #    用户连未接记录都看不到（实测过）。
+    if yak_notify(num, "voip"):
+        time.sleep(YAK_WAKE_DELAY)      # 等 App 被唤醒并重新 REGISTER
+
+    # ② 再叫分机
+    log("呼叫 SIP 分机", EXT)
+    ok, detail = AMI().originate("PJSIP/" + EXT, "AudioSocket", AUDIOSOCKET)
     log("  AMI originate ->", "ok" if ok else "失败", detail[:100])
     if not ok:
         # 分机叫不响，别让对方一直等
@@ -227,6 +237,43 @@ def on_ring():
     log("检测到振铃")
 
 
+def yak_notify(caller, kind="voip", call_id=None):
+    """调 Yak 的推送中继把手机叫醒。失败只记日志，不阻断呼叫。
+
+    设备上的 Python 缺 idna 编码器，urllib 走域名会直接 LookupError，
+    所以用 curl 发（这台机器 curl/wget 都有）。
+    """
+    try:
+        with open(YAK_TOKEN_FILE, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError:
+        log("  未配置 Yak token（%s），跳过推送" % YAK_TOKEN_FILE)
+        return False
+    if not token:
+        return False
+
+    payload = {
+        "token": token,
+        "caller_uri": "sip:%s@%s" % (caller, YAK_SIP_DOMAIN),
+        "caller_name": caller,
+        "type": kind,
+        "call_id": call_id or ("mu300-%d" % int(time.time() * 1000)),
+    }
+    try:
+        r = subprocess.run(
+            ["curl", "-sS", "-m", "8", "-X", "POST", YAK_PUSH_URL,
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps(payload, ensure_ascii=False)],
+            capture_output=True, text=True, timeout=12)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        ok = '"ok":true' in out.replace(" ", "")
+        log("  Yak 推送(%s) -> %s %s" % (kind, "ok" if ok else "失败", out[:60]))
+        return ok
+    except Exception as e:                                # noqa: BLE001
+        log("  Yak 推送异常:", repr(e))
+        return False
+
+
 def hangup_extension():
     """把 Asterisk 上还在振铃的分机通道挂掉。
 
@@ -239,7 +286,7 @@ def hangup_extension():
                            capture_output=True, text=True, timeout=8)
         names = []
         for line in (r.stdout or "").splitlines():
-            if any(line.startswith("PJSIP/%s-" % e) for e in EXTS):
+            if line.startswith("PJSIP/%s-" % EXT):
                 names.append(line.split("!")[0])
         for ch in names:
             subprocess.run(["asterisk", "-rx", "channel request hangup %s" % ch],
@@ -331,7 +378,7 @@ def tail():
 
 
 def main():
-    log("volte-in 启动（分机 %s）" % ",".join(EXTS))
+    log("volte-in 启动（分机 %s）" % EXT)
     out = at("AT+CLIP=1", 6)
     log("AT+CLIP=1 ->", out.strip().splitlines()[-1] if out.strip() else "?")
     threading.Thread(target=watchdog, daemon=True).start()
